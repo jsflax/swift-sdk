@@ -27,8 +27,13 @@ import Testing
             return mockState
         }
 
+        /// Observe actual send completions without reading the mock's mutable buffers.
+        private let onSendCompleted: (@Sendable (Data, NWError?) -> Void)?
+
         /// Initialize a mock connection
-        init() {}
+        init(onSendCompleted: (@Sendable (Data, NWError?) -> Void)? = nil) {
+            self.onSendCompleted = onSendCompleted
+        }
 
         /// Start the connection
         func start(queue: DispatchQueue) {
@@ -56,7 +61,11 @@ import Testing
             switch completion {
             case .contentProcessed(let handler):
                 Task { @MainActor in
-                    handler(self.mockError as? NWError)
+                    let error = self.mockError as? NWError
+                    handler(error)
+                    if let content = content {
+                        self.onSendCompleted?(content, error)
+                    }
                 }
             default:
                 break
@@ -603,37 +612,83 @@ import Testing
 
         @Test("Heartbeat Failure Handling")
         func testHeartbeatFailureHandling() async throws {
-            let mockConnection = MockNetworkConnection()
+            let (heartbeats, heartbeatContinuation) = AsyncStream<Bool>.makeStream()
+            let mockConnection = MockNetworkConnection(onSendCompleted: { content, error in
+                guard NetworkTransport.Heartbeat.isHeartbeat(content) else { return }
+                heartbeatContinuation.yield(error == nil)
+                heartbeatContinuation.finish()
+            })
 
-            // Create transport with rapid heartbeats
             let heartbeatConfig = NetworkTransport.HeartbeatConfiguration(
                 enabled: true,
                 interval: 0.1
             )
-
             let transport = NetworkTransport(
                 mockConnection,
-                heartbeatConfig: heartbeatConfig
+                heartbeatConfig: heartbeatConfig,
+                // This is the terminal-failure scenario. Automatic recovery has
+                // its own tests and may change the connection state after failure.
+                reconnectionConfig: .disabled
             )
 
-            try await transport.connect()
-
-            // Wait for initial heartbeat
-            try await Task.sleep(for: .seconds(1.2))
-
-            // Simulate failure during heartbeat
-            mockConnection.simulateFailure(error: NWError.posix(POSIXErrorCode.ECONNRESET))
-
-            // Wait for potential recovery
-            try await Task.sleep(for: .milliseconds(500))
-
-            // Verify connection state
-            if case .failed = mockConnection.state {
-                // expected
-            } else {
-                Issue.record("Expected state to be failed")
+            func completesWithinBudget(
+                _ operation: @escaping @Sendable () async -> Bool
+            ) async -> Bool {
+                await withTaskGroup(of: Bool.self) { group in
+                    group.addTask(operation: operation)
+                    group.addTask {
+                        try? await Task.sleep(for: .seconds(5))
+                        return false
+                    }
+                    let completed = await group.next() ?? false
+                    group.cancelAll()
+                    return completed
+                }
             }
 
+            try await transport.connect()
+            do {
+                // Prove a heartbeat actually completed successfully before
+                // injecting the connection failure; elapsed time is not evidence.
+                let sentHeartbeat = await completesWithinBudget {
+                    var iterator = heartbeats.makeAsyncIterator()
+                    return await iterator.next() == true
+                }
+                try #require(sentHeartbeat, "No successful heartbeat send was observed")
+
+                let messages = await transport.receive()
+                await MainActor.run {
+                    mockConnection.simulateFailure(
+                        error: NWError.posix(POSIXErrorCode.ECONNRESET))
+                }
+
+                // The mock sets its own failed state. The transport must also
+                // deliver the injected error through its public receive stream.
+                let propagatedFailure = await completesWithinBudget {
+                    do {
+                        var iterator = messages.makeAsyncIterator()
+                        _ = try await iterator.next()
+                        return false
+                    } catch let error as MCPError {
+                        guard case .transportError(let underlying) = error,
+                              let networkError = underlying as? NWError
+                        else { return false }
+                        if case .posix(.ECONNRESET) = networkError { return true }
+                        return false
+                    } catch {
+                        return false
+                    }
+                }
+                #expect(propagatedFailure, "The receive stream must report the injected failure")
+                let remainsFailed = await MainActor.run {
+                    if case .failed = mockConnection.state { return true }
+                    return false
+                }
+                #expect(remainsFailed, "Expected state to be failed with reconnection disabled")
+            } catch {
+                await transport.disconnect()
+                throw error
+            }
             await transport.disconnect()
         }
 
