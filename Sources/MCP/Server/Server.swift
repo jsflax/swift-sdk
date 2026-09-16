@@ -2,6 +2,7 @@ import Logging
 
 import struct Foundation.Data
 import struct Foundation.Date
+import struct Foundation.UUID
 import class Foundation.JSONDecoder
 import class Foundation.JSONEncoder
 
@@ -166,7 +167,8 @@ public actor Server {
     /// Notification handlers
     private var notificationHandlers: [String: [NotificationHandlerBox]] = [:]
     /// Pending request tasks (for cancellation support)
-    private var pendingRequestTasks: [ID: Task<Response<AnyMethod>, Error>] = [:]
+    private var pendingRequestTasks: [ID: UUID] = [:]
+    private var handlerTasks: [UUID: Task<Response<AnyMethod>, Error>] = [:]
 
     /// Pending requests sent to the client, awaiting responses
     private var pendingRequests: [ID: AnyPendingRequest] = [:]
@@ -183,6 +185,16 @@ public actor Server {
     private var subscriptions: [String: Set<ID>] = [:]
     /// The task for the message handling loop
     private var task: Task<Void, Never>?
+    private let lifetimeID = UUID()
+    @TaskLocal private static var enteredLifetimeIDs: Set<UUID> = []
+    private var started = false
+    private var admissionClosed = false
+    private var connectTask: Task<Void, Error>?
+    private var shutdownTask: Task<Void, Never>?
+    private var operationTasks: [UUID: Task<Void, Never>] = [:]
+    private var operationDrain: Task<Void, Never>?
+    private var wireTasks: [UUID: Task<Void, Error>] = [:]
+    public private(set) var isShutdownComplete = false
 
     public init(
         name: String,
@@ -206,21 +218,34 @@ public actor Server {
         transport: any Transport,
         initializeHook: (@Sendable (Client.Info, Client.Capabilities) async throws -> Void)? = nil
     ) async throws {
+        guard !started, !admissionClosed else { throw CancellationError() }
+        started = true
         self.connection = transport
         registerDefaultHandlers(initializeHook: initializeHook)
         registerCancellationHandler()
-        try await transport.connect()
+        let connector = Task {
+            try await Self.$enteredLifetimeIDs.withValue(Self.enteredLifetimeIDs.union([lifetimeID])) {
+                try Task.checkCancellation()
+                try await transport.connect()
+            }
+        }
+        connectTask = connector
+        do { try await connector.value }
+        catch { closeAdmission(); throw error }
+        guard !admissionClosed else { throw CancellationError() }
 
         await logger?.debug(
             "Server started", metadata: ["name": "\(name)", "version": "\(version)"]
         )
+        guard !admissionClosed else { throw CancellationError() }
 
         // Start message handling loop
         task = Task {
+            await Self.$enteredLifetimeIDs.withValue(Self.enteredLifetimeIDs.union([lifetimeID])) {
             do {
                 let stream = await transport.receive()
                 for try await data in stream {
-                    if Task.isCancelled { break }  // Check cancellation inside loop
+                    if admissionClosed || Task.isCancelled { break }
 
                     var requestID: ID?
                     do {
@@ -232,7 +257,7 @@ public actor Server {
                             await handleResponse(response)
                         } else if let request = try? decoder.decode(AnyRequest.self, from: data) {
                             // Handle request in a separate task to avoid blocking the receive loop
-                            Task {
+                            try retainOperation {
                                 _ = try? await self.handleRequest(request, sendResponse: true)
                             }
                         } else if let message = try? decoder.decode(AnyMessage.self, from: data) {
@@ -271,13 +296,18 @@ public actor Server {
                     "Fatal error in message handling loop", metadata: ["error": "\(error)"])
             }
             await logger?.debug("Server finished", metadata: [:])
+            }
         }
     }
 
-    /// Stop the server
-    public func stop() async {
+    /// Close admission synchronously on the actor. This is not a drain receipt.
+    public func closeAdmission() {
+        admissionClosed = true
+        connectTask?.cancel()
         task?.cancel()
-        task = nil
+        for owner in operationTasks.values { owner.cancel() }
+        for handler in handlerTasks.values { handler.cancel() }
+        for writer in wireTasks.values { writer.cancel() }
 
         // Clear pending requests with errors
         let pendingRequestsToCancel = self.pendingRequests
@@ -286,25 +316,97 @@ public actor Server {
             request.resume(throwing: MCPError.internalError("Server disconnected"))
         }
 
-        if let connection = connection {
-            await connection.disconnect()
-        }
-        connection = nil
     }
 
+    /// Close and join this server's owned tasks. False means an entered callback
+    /// requested closure but cannot join its own ancestor. The external lifetime
+    /// owner must call again and require true. This never claims process exit.
+    @discardableResult public func stop() async -> Bool {
+        await waitForShutdown()
+    }
+
+    @discardableResult public func waitForShutdown() async -> Bool {
+        closeAdmission()
+        guard !Self.enteredLifetimeIDs.contains(lifetimeID) else { return false }
+        if shutdownTask == nil {
+            shutdownTask = Task {
+                await Self.$enteredLifetimeIDs.withValue(Self.enteredLifetimeIDs.union([lifetimeID])) {
+                    await self.joinOwnedTasks()
+                }
+            }
+        }
+        await shutdownTask?.value
+        return isShutdownComplete
+    }
+
+    private func joinOwnedTasks() async {
+        _ = await connectTask?.result
+        // The selected private stdio transport joins its own I/O here. For an
+        // unrelated Transport, this server proves only its own owners joined.
+        await connection?.disconnect()
+        await task?.value
+        await operationDrain?.value
+        let writes = Array(wireTasks.values)
+        for writer in writes { _ = await writer.result }
+        // Every handler is awaited by its retained request/batch owner above.
+        task = nil
+        connectTask = nil
+        operationTasks.removeAll()
+        operationDrain = nil
+        handlerTasks.removeAll()
+        pendingRequestTasks.removeAll()
+        wireTasks.removeAll()
+        connection = nil
+        isShutdownComplete = true
+    }
+
+    /// Receive-loop completion only. Cancelling this waiter does not cancel the
+    /// server; use stop()/waitForShutdown() from its external lifetime owner.
     public func waitUntilCompleted() async {
         await task?.value
     }
 
+    /// Keep actual dispatch, response encoding/write, and cleanup in one owner.
+    /// A UUID owns lifetime; a repeated JSON-RPC ID cannot overwrite custody.
+    private func retainOperation(_ operation: @escaping @Sendable () async -> Void) throws {
+        guard !admissionClosed, operationTasks.count < 256 else {
+            throw MCPError.internalError("Server is closed or at its request limit")
+        }
+        let id = UUID()
+        let owner = Task {
+            await Self.$enteredLifetimeIDs.withValue(Self.enteredLifetimeIDs.union([lifetimeID])) {
+                guard !admissionClosed, !Task.isCancelled else { return }
+                await operation()
+            }
+        }
+        operationTasks[id] = owner
+        let predecessor = operationDrain
+        operationDrain = Task {
+            await Self.$enteredLifetimeIDs.withValue(Self.enteredLifetimeIDs.union([lifetimeID])) {
+                await predecessor?.value
+                await owner.value
+                operationTasks.removeValue(forKey: id)
+            }
+        }
+    }
+
     // MARK: - Request Context
 
-    /// The JSON-RPC request ID of the currently executing method handler.
-    ///
-    /// Set via `@TaskLocal` before dispatching each request, so it propagates
-    /// automatically into the handler task. Accessible package-wide for
-    /// transports that need to identify the active request (e.g. closing an
-    /// SSE stream mid-call for reconnection testing per SEP-1699).
-    @TaskLocal package static var currentRequestID: ID? = nil
+    private struct HandlerRequestContext: Sendable {
+        let owner: UUID
+        let requestID: ID
+    }
+
+    @TaskLocal private static var handlerRequestContext: HandlerRequestContext? = nil
+
+    /// The active handler's request ID, retained for package callers such as
+    /// SEP-1699 stream control. This accessor alone does not authorize routing
+    /// a different server's outgoing request to that ID.
+    package static var currentRequestID: ID? { handlerRequestContext?.requestID }
+
+    /// Request association qualified by the sending server, scoped to its
+    /// selected connection.send call and transparent forwarding delegates.
+    @TaskLocal package static var outboundRequestID: ID? = nil
 
     // MARK: - Registration
 
@@ -336,70 +438,84 @@ public actor Server {
 
     /// Send a response to a request
     public func send<M: Method>(_ response: Response<M>) async throws {
-        guard let connection = connection else {
-            throw MCPError.internalError("Server connection not initialized")
-        }
+        guard !admissionClosed else { throw CancellationError() }
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
 
         let responseData = try encoder.encode(response)
-        try await connection.send(responseData)
+        try await sendData(responseData)
     }
 
     /// Send a notification to connected clients
     public func notify<N: Notification>(_ notification: Message<N>) async throws {
-        guard let connection = connection else {
-            throw MCPError.internalError("Server connection not initialized")
-        }
+        guard !admissionClosed else { throw CancellationError() }
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
 
         let notificationData = try encoder.encode(notification)
-        try await connection.send(notificationData)
+        try await sendData(notificationData)
     }
 
-    /// Send a request to the client and return a Task for the response
-    private func send<M: Method>(_ request: Request<M>) throws -> Task<M.Result, Error> {
-        guard let connection = connection else {
+    /// The caller owns its await; the actual wire writer remains server-owned.
+    /// Closure resumes pending responses and joins the independent writer.
+    private func sendAndAwait<M: Method>(_ request: Request<M>) async throws -> M.Result {
+        try Task.checkCancellation()
+        guard !admissionClosed, connection != nil else {
             throw MCPError.internalError("Server connection not initialized")
         }
-
+        guard pendingRequests[request.id] == nil else {
+            throw MCPError.invalidRequest("Request ID is already pending")
+        }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         let requestData = try encoder.encode(request)
-
-        let requestTask = Task<M.Result, Error> {
-            try await withCheckedThrowingContinuation { continuation in
-                Task {
-                    // Add pending response before sending
-                    self.addPendingResponse(
-                        id: request.id,
-                        continuation: continuation,
-                        type: M.Result.self
-                    )
-
-                    // Send the request
+        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<M.Result, Error>) in
+            guard !admissionClosed else {
+                continuation.resume(throwing: CancellationError())
+                return
+            }
+            addPendingResponse(id: request.id, continuation: continuation, type: M.Result.self)
+            do {
+                try retainOperation {
                     do {
-                        try await connection.send(requestData)
+                        try await self.sendData(requestData)
                     } catch {
-                        // If send fails, remove pending response and resume with error
-                        if self.removePendingResponse(id: request.id) != nil {
-                            continuation.resume(throwing: error)
-                        }
+                        await self.failPendingResponse(id: request.id, error: error)
                     }
+                }
+            } catch {
+                removePendingResponse(id: request.id)?.resume(throwing: error)
+            }
+        }
+    }
+
+    private func sendData(_ data: Data) async throws {
+        try Task.checkCancellation()
+        guard !admissionClosed, let connection, wireTasks.count < 256 else {
+            throw MCPError.internalError("Server is closed or at its write limit")
+        }
+        let id = UUID()
+        let context = Self.handlerRequestContext
+        let associatedRequestID = context?.owner == lifetimeID ? context?.requestID : nil
+        let writer = Task {
+            try await Self.$enteredLifetimeIDs.withValue(Self.enteredLifetimeIDs.union([lifetimeID])) {
+                try Task.checkCancellation()
+                // Bind nil too: a nested send by another server must clear any
+                // inherited wire association instead of claiming its request ID.
+                try await Self.$outboundRequestID.withValue(associatedRequestID) {
+                    try await connection.send(data)
                 }
             }
         }
-
-        return requestTask
-    }
-
-    /// Send a request and await its response
-    private func sendAndAwait<M: Method>(_ request: Request<M>) async throws -> M.Result {
-        let task = try send(request)
-        return try await task.value
+        wireTasks[id] = writer
+        defer { wireTasks.removeValue(forKey: id) }
+        try await withTaskCancellationHandler {
+            try await writer.value
+        } onCancel: {
+            writer.cancel()
+        }
     }
 
     private func addPendingResponse<T: Sendable & Decodable>(
@@ -414,6 +530,10 @@ public actor Server {
 
     private func removePendingResponse(id: ID) -> AnyPendingRequest? {
         return pendingRequests.removeValue(forKey: id)
+    }
+
+    private func failPendingResponse(id: ID, error: Error) {
+        removePendingResponse(id: id)?.resume(throwing: error)
     }
 
     // MARK: - Sampling
@@ -649,6 +769,8 @@ public actor Server {
 
     /// Process a batch of requests and/or notifications
     private func handleBatch(_ batch: Batch) async throws {
+        guard !admissionClosed else { throw CancellationError() }
+        try Task.checkCancellation()
         await logger?.trace("Processing batch request", metadata: ["size": "\(batch.items.count)"])
 
         if batch.items.isEmpty {
@@ -663,6 +785,8 @@ public actor Server {
         var responses: [Response<AnyMethod>] = []
 
         for item in batch.items {
+            guard !admissionClosed else { throw CancellationError() }
+            try Task.checkCancellation()
             do {
                 switch item {
                 case .request(let request):
@@ -691,11 +815,7 @@ public actor Server {
             encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
             let responseData = try encoder.encode(responses)
 
-            guard let connection = connection else {
-                throw MCPError.internalError("Server connection not initialized")
-            }
-
-            try await connection.send(responseData)
+            try await sendData(responseData)
         }
     }
 
@@ -710,6 +830,8 @@ public actor Server {
     private func handleRequest(_ request: Request<AnyMethod>, sendResponse: Bool = true)
         async throws -> Response<AnyMethod>?
     {
+        guard !admissionClosed else { throw CancellationError() }
+        try Task.checkCancellation()
         // Check if this is a pre-processed error request (empty method)
         if request.method.isEmpty && !sendResponse {
             // This is a placeholder for an invalid request that couldn't be parsed in batch mode
@@ -725,6 +847,9 @@ public actor Server {
                 "method": "\(request.method)",
                 "id": "\(request.id)",
             ])
+
+        guard !admissionClosed else { throw CancellationError() }
+        try Task.checkCancellation()
 
         if configuration.strict {
             // The client SHOULD NOT send requests other than pings
@@ -751,9 +876,9 @@ public actor Server {
         }
 
         // Create a task to handle the request with cancellation support.
-        // Set currentRequestID as a task local so handlers can identify the active request.
+        // Keep request identity and its owning server together through child tasks.
         var handlerTask: Task<Response<AnyMethod>, Error>!
-        Server.$currentRequestID.withValue(request.id) {
+        Self.$handlerRequestContext.withValue(HandlerRequestContext(owner: lifetimeID, requestID: request.id)) {
             handlerTask = Task<Response<AnyMethod>, Error> {
                 do {
                     // Check if task was cancelled before starting
@@ -761,6 +886,7 @@ public actor Server {
 
                     // Handle request and get response
                     let response = try await handler(request)
+                    try Task.checkCancellation()
                     return response
                 } catch is CancellationError {
                     // Request was cancelled, don't send a response per MCP spec
@@ -778,11 +904,16 @@ public actor Server {
         }
 
         // Store the handler task for potential cancellation
-        pendingRequestTasks[request.id] = handlerTask
+        let handlerID = UUID()
+        handlerTasks[handlerID] = handlerTask
+        pendingRequestTasks[request.id] = handlerID
 
         // Ensure cleanup happens regardless of success or failure
         defer {
-            pendingRequestTasks.removeValue(forKey: request.id)
+            if pendingRequestTasks[request.id] == handlerID {
+                pendingRequestTasks.removeValue(forKey: request.id)
+            }
+            handlerTasks.removeValue(forKey: handlerID)
         }
 
         do {
@@ -812,6 +943,8 @@ public actor Server {
     }
 
     private func handleMessage(_ message: Message<AnyNotification>) async throws {
+        guard !admissionClosed else { throw CancellationError() }
+        try Task.checkCancellation()
         await logger?.trace(
             "Processing notification",
             metadata: ["method": "\(message.method)"])
@@ -828,6 +961,8 @@ public actor Server {
 
         // Convert notification parameters to concrete type and call handlers
         for handler in handlers {
+            guard !admissionClosed else { throw CancellationError() }
+            try Task.checkCancellation()
             do {
                 try await handler(message)
             } catch {
@@ -936,7 +1071,8 @@ public actor Server {
 
     /// Cancel and remove a pending request task
     private func removePendingRequest(id: ID) -> Task<Response<AnyMethod>, Error>? {
-        pendingRequestTasks.removeValue(forKey: id)
+        guard let handlerID = pendingRequestTasks.removeValue(forKey: id) else { return nil }
+        return handlerTasks[handlerID]
     }
 
     private func registerCancellationHandler() {

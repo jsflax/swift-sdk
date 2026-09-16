@@ -4,7 +4,7 @@ on:
   push:
     branches: ["main"]
   pull_request:
-    branches: ["main"]
+    branches: ["main", "codex/sdk-0.12-base-20260916"]
 
 permissions:
   contents: read
@@ -15,7 +15,7 @@ jobs:
     timeout-minutes: 10
     strategy:
       matrix:
-        os: [macos-latest, ubuntu-latest]
+        os: [macos-15, ubuntu-latest]
         swift-version:
           - 6.1.0
 
@@ -36,11 +36,18 @@ jobs:
         uses: vapor/swiftly-action@v0.2
         with:
           toolchain: ${{ matrix.swift-version }}
-      - name: Setup Swift on macOS
-        if: matrix.os == 'macos-latest'
-        uses: swift-actions/setup-swift@v2
-        with:
-          swift-version: ${{ matrix.swift-version }}
+      - name: Select Xcode 16.3 and its Swift 6.1 toolchain
+        if: matrix.os == 'macos-15'
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_16.3.app/Contents/Developer
+        run: |
+          echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
+          echo "$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin" >> "$GITHUB_PATH"
+          xcodebuild -version
+          xcrun --find swift
+          xcrun swift --version
+          xcrun --sdk macosx --show-sdk-path
+          xcrun --sdk macosx --show-sdk-version
 
       - name: Build
         run: swift build -v
@@ -50,16 +57,23 @@ jobs:
 
   conformance:
     timeout-minutes: 10
-    runs-on: macos-latest
+    runs-on: macos-15
     name: MCP Conformance Tests
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Swift
-        uses: swift-actions/setup-swift@v2
-        with:
-          swift-version: 6.1.0
+      - name: Select Xcode 16.3 and its Swift 6.1 toolchain
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_16.3.app/Contents/Developer
+        run: |
+          echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
+          echo "$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin" >> "$GITHUB_PATH"
+          xcodebuild -version
+          xcrun --find swift
+          xcrun swift --version
+          xcrun --sdk macosx --show-sdk-path
+          xcrun --sdk macosx --show-sdk-version
 
       - name: Build Swift executables
         run: |
@@ -77,18 +91,33 @@ jobs:
 
       - name: Start server for testing
         run: |
-          .build/debug/mcp-everything-server &
+          .build/debug/mcp-everything-server > "$RUNNER_TEMP/conformance-server.log" 2>&1 &
           echo "SERVER_PID=$!" >> $GITHUB_ENV
           sleep 3
 
-      - name: Run server conformance tests
-        uses: modelcontextprotocol/conformance@v0.1.15
+      # The pinned composite action does not expose --output-dir. Run its
+      # exact CLI so failed checks retain the error omitted from its summary.
+      - name: Check out pinned server conformance runner
+        uses: actions/checkout@v4
         with:
-          mode: server
-          url: 'http://localhost:3001/mcp'
-          suite: 'core'
-          expected-failures: './conformance-baseline.yml'
-          node-version: '22'
+          repository: modelcontextprotocol/conformance
+          ref: a2855b03582a6c0b31065ad4d9af248316ce61a3 # v0.1.15
+          path: .conformance-runner
+          persist-credentials: false
+
+      - name: Build server conformance runner
+        working-directory: .conformance-runner
+        run: |
+          npm ci
+          npm run build
+
+      - name: Run server conformance tests
+        run: |
+          node .conformance-runner/dist/index.js server \
+            --url http://localhost:3001/mcp \
+            --suite core \
+            --expected-failures ./conformance-baseline.yml \
+            --output-dir "$RUNNER_TEMP/conformance-results"
 
       - name: Cleanup server
         if: always()
@@ -97,15 +126,33 @@ jobs:
             kill $SERVER_PID 2>/dev/null || true
           fi
 
+      - name: Retain server conformance diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-conformance-diagnostics
+          path: |
+            ${{ runner.temp }}/conformance-results
+            ${{ runner.temp }}/conformance-server.log
+          if-no-files-found: warn
+
   documentation:
     name: Documentation
-    runs-on: macos-latest
+    runs-on: macos-15
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: swift-actions/setup-swift@v2
-        with:
-          swift-version: "6.1.0"
+      - name: Select Xcode 16.3 and its Swift 6.1 toolchain
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_16.3.app/Contents/Developer
+        run: |
+          echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
+          echo "$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin" >> "$GITHUB_PATH"
+          xcodebuild -version
+          xcrun --find swift
+          xcrun swift --version
+          xcrun --sdk macosx --show-sdk-path
+          xcrun --sdk macosx --show-sdk-version
       - name: Build Documentation
         run: swift package generate-documentation --target MCP --warnings-as-errors
 
