@@ -1,6 +1,7 @@
 import Logging
 
 import struct Foundation.Data
+import struct Foundation.UUID
 
 #if canImport(System)
     import System
@@ -54,6 +55,13 @@ import struct Foundation.Data
         public nonisolated let logger: Logger
 
         private var isConnected = false
+        private var admissionClosed = false
+        private let lifetimeID = UUID()
+        @TaskLocal private static var enteredLifetimeIDs: Set<UUID> = []
+        private var readerTask: Task<Void, Never>?
+        private var writeTasks: [UUID: Task<Void, Error>] = [:]
+        private var shutdownTask: Task<Void, Never>?
+        public private(set) var isShutdownComplete = false
         private let messageStream: AsyncThrowingStream<Data, Swift.Error>
         private let messageContinuation: AsyncThrowingStream<Data, Swift.Error>.Continuation
 
@@ -89,6 +97,8 @@ import struct Foundation.Data
         ///
         /// - Throws: Error if the file descriptors cannot be configured
         public func connect() async throws {
+            try Task.checkCancellation()
+            guard !admissionClosed else { throw CancellationError() }
             guard !isConnected else { return }
 
             // Set non-blocking mode
@@ -99,8 +109,10 @@ import struct Foundation.Data
             logger.debug("Transport connected successfully")
 
             // Start reading loop in background
-            Task {
-                await readLoop()
+            readerTask = Task {
+                await Self.$enteredLifetimeIDs.withValue(Self.enteredLifetimeIDs.union([lifetimeID])) {
+                    await readLoop()
+                }
             }
         }
 
@@ -179,11 +191,45 @@ import struct Foundation.Data
         /// Disconnects from the transport
         ///
         /// This stops the message reading loop and releases associated resources.
-        public func disconnect() async {
-            guard isConnected else { return }
+        public func closeAdmission() {
+            admissionClosed = true
             isConnected = false
+            readerTask?.cancel()
+            for write in writeTasks.values { write.cancel() }
             messageContinuation.finish()
-            logger.debug("Transport disconnected")
+        }
+
+        /// Does not close, replace, or restore inherited file descriptors. The
+        /// original connect contract requires successful nonblocking setup.
+        /// True means the owned reader and writes joined, not process exit.
+        @discardableResult public func waitForShutdown() async -> Bool {
+            closeAdmission()
+            guard !Self.enteredLifetimeIDs.contains(lifetimeID) else { return false }
+            if shutdownTask == nil {
+                shutdownTask = Task {
+                    await Self.$enteredLifetimeIDs.withValue(Self.enteredLifetimeIDs.union([lifetimeID])) {
+                        await self.joinOwnedTasks()
+                    }
+                }
+            }
+            await shutdownTask?.value
+            return isShutdownComplete
+        }
+
+        private func joinOwnedTasks() async {
+            let reader = readerTask
+            let writes = Array(writeTasks.values)
+            await reader?.value
+            for write in writes { _ = await write.result }
+            readerTask = nil
+            writeTasks.removeAll()
+            isShutdownComplete = true
+        }
+
+        /// Protocol compatibility. An entered transport descendant only requests
+        /// closure; external owners use waitForShutdown and require true.
+        public func disconnect() async {
+            _ = await waitForShutdown()
         }
 
         /// Sends a message over the transport.
@@ -195,9 +241,28 @@ import struct Foundation.Data
         /// - Parameter message: The message data to send (without a trailing newline)
         /// - Throws: Error if the message cannot be sent
         public func send(_ message: Data) async throws {
-            guard isConnected else {
+            guard isConnected, !admissionClosed else {
                 throw MCPError.transportError(Errno(rawValue: ENOTCONN))
             }
+            try Task.checkCancellation()
+            let id = UUID()
+            let writer = Task {
+                try await Self.$enteredLifetimeIDs.withValue(Self.enteredLifetimeIDs.union([lifetimeID])) {
+                    try await writeFrame(message)
+                }
+            }
+            writeTasks[id] = writer
+            defer { writeTasks.removeValue(forKey: id) }
+            try await withTaskCancellationHandler {
+                try await writer.value
+            } onCancel: {
+                writer.cancel()
+            }
+        }
+
+        private func writeFrame(_ message: Data) async throws {
+            try Task.checkCancellation()
+            guard isConnected, !admissionClosed else { throw CancellationError() }
 
             // Add newline as delimiter
             var messageWithNewline = message
@@ -205,12 +270,17 @@ import struct Foundation.Data
 
             var remaining = messageWithNewline
             while !remaining.isEmpty {
+                try Task.checkCancellation()
+                guard isConnected, !admissionClosed else { throw CancellationError() }
                 do {
                     let written = try remaining.withUnsafeBytes { buffer in
                         try output.write(UnsafeRawBufferPointer(buffer))
                     }
                     if written > 0 {
                         remaining = remaining.dropFirst(written)
+                    } else {
+                        // A zero-byte nonblocking write must yield to closure.
+                        try await Task.sleep(for: .milliseconds(10))
                     }
                 } catch let error where MCPError.isResourceTemporarilyUnavailable(error) {
                     try await Task.sleep(for: .milliseconds(10))
