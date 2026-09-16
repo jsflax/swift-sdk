@@ -30,9 +30,22 @@ import Testing
         /// Observe actual send completions without reading the mock's mutable buffers.
         private let onSendCompleted: (@Sendable (Data, NWError?) -> Void)?
 
+        /// Opt-in pending reads let a test inject failure into an actual receive.
+        private let holdEmptyReceives: Bool
+        private let onReceivePending: (@Sendable () -> Void)?
+        @MainActor private var pendingReceive: (@Sendable (
+            Data?, NWConnection.ContentContext?, Bool, NWError?
+        ) -> Void)?
+
         /// Initialize a mock connection
-        init(onSendCompleted: (@Sendable (Data, NWError?) -> Void)? = nil) {
+        init(
+            onSendCompleted: (@Sendable (Data, NWError?) -> Void)? = nil,
+            holdEmptyReceives: Bool = false,
+            onReceivePending: (@Sendable () -> Void)? = nil
+        ) {
             self.onSendCompleted = onSendCompleted
+            self.holdEmptyReceives = holdEmptyReceives
+            self.onReceivePending = onReceivePending
         }
 
         /// Start the connection
@@ -95,7 +108,12 @@ import Testing
                 }
 
                 if self.dataToReceive.isEmpty {
-                    completion(Data(), nil, false, nil)
+                    if self.holdEmptyReceives {
+                        self.pendingReceive = completion
+                        self.onReceivePending?()
+                    } else {
+                        completion(Data(), nil, false, nil)
+                    }
                     return
                 }
 
@@ -107,6 +125,11 @@ import Testing
         /// Cancel the connection
         func cancel() {
             updateState(.cancelled)
+            Task { @MainActor in
+                let completion = self.pendingReceive
+                self.pendingReceive = nil
+                completion?(nil, nil, true, NWError.posix(.ECANCELED))
+            }
         }
 
         // Test helpers
@@ -131,6 +154,17 @@ import Testing
             } else {
                 updateState(.failed(NWError.posix(POSIXErrorCode(rawValue: 57)!)))
             }
+        }
+
+        /// Fail the held receive exactly once, after the test observes readiness.
+        @MainActor
+        func failPendingReceive(error: NWError) -> Bool {
+            guard let completion = pendingReceive else { return false }
+            pendingReceive = nil
+            mockError = error
+            updateState(.failed(error))
+            completion(nil, nil, false, error)
+            return true
         }
 
         /// Simulate connection cancellation
@@ -613,11 +647,19 @@ import Testing
         @Test("Heartbeat Failure Handling")
         func testHeartbeatFailureHandling() async throws {
             let (heartbeats, heartbeatContinuation) = AsyncStream<Bool>.makeStream()
-            let mockConnection = MockNetworkConnection(onSendCompleted: { content, error in
-                guard NetworkTransport.Heartbeat.isHeartbeat(content) else { return }
-                heartbeatContinuation.yield(error == nil)
-                heartbeatContinuation.finish()
-            })
+            let (pendingReceives, pendingReceiveContinuation) = AsyncStream<Bool>.makeStream()
+            let mockConnection = MockNetworkConnection(
+                onSendCompleted: { content, error in
+                    guard NetworkTransport.Heartbeat.isHeartbeat(content) else { return }
+                    heartbeatContinuation.yield(error == nil)
+                    heartbeatContinuation.finish()
+                },
+                holdEmptyReceives: true,
+                onReceivePending: {
+                    pendingReceiveContinuation.yield(true)
+                    pendingReceiveContinuation.finish()
+                }
+            )
 
             let heartbeatConfig = NetworkTransport.HeartbeatConfiguration(
                 enabled: true,
@@ -656,11 +698,19 @@ import Testing
                 }
                 try #require(sentHeartbeat, "No successful heartbeat send was observed")
 
-                let messages = await transport.receive()
-                await MainActor.run {
-                    mockConnection.simulateFailure(
-                        error: NWError.posix(POSIXErrorCode.ECONNRESET))
+                // Keep a real receive outstanding instead of repeatedly returning
+                // empty reads while the heartbeat is being established.
+                let receiveIsPending = await completesWithinBudget {
+                    var iterator = pendingReceives.makeAsyncIterator()
+                    return await iterator.next() == true
                 }
+                try #require(receiveIsPending, "No pending receive was observed")
+
+                let messages = await transport.receive()
+                let injectedFailure = await MainActor.run {
+                    mockConnection.failPendingReceive(error: NWError.posix(.ECONNRESET))
+                }
+                try #require(injectedFailure, "The pending receive must accept the failure")
 
                 // The mock sets its own failed state. The transport must also
                 // deliver the injected error through its public receive stream.

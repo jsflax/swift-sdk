@@ -130,7 +130,9 @@ public actor StatefulHTTPServerTransport: Transport {
     /// Routes outgoing server messages to the appropriate client connection.
     ///
     /// - Responses are routed to the SSE stream matching the response's JSON-RPC ID.
-    /// - Notifications and server-initiated requests are routed to the standalone GET stream.
+    /// - Requests associated with this server's handler retain the originating SSE stream,
+    ///   including while that stream is disconnected and awaiting replay.
+    /// - Unsolicited server requests and notifications use the standalone GET stream.
     public func send(_ data: Data) async throws {
         guard !terminated else {
             throw MCPError.connectionClosed
@@ -144,7 +146,13 @@ public actor StatefulHTTPServerTransport: Transport {
         switch kind {
         case .response(let id):
             routeResponse(data, requestID: id)
-        case .notification, .request:
+        case .request:
+            if let requestID = Server.outboundRequestID {
+                routeToRequestStream(data, requestID: requestID.description)
+            } else {
+                routeServerInitiatedMessage(data)
+            }
+        case .notification:
             routeServerInitiatedMessage(data)
         }
     }

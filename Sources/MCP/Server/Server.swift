@@ -392,13 +392,21 @@ public actor Server {
 
     // MARK: - Request Context
 
-    /// The JSON-RPC request ID of the currently executing method handler.
-    ///
-    /// Set via `@TaskLocal` before dispatching each request, so it propagates
-    /// automatically into the handler task. Accessible package-wide for
-    /// transports that need to identify the active request (e.g. closing an
-    /// SSE stream mid-call for reconnection testing per SEP-1699).
-    @TaskLocal package static var currentRequestID: ID? = nil
+    private struct HandlerRequestContext: Sendable {
+        let owner: UUID
+        let requestID: ID
+    }
+
+    @TaskLocal private static var handlerRequestContext: HandlerRequestContext? = nil
+
+    /// The active handler's request ID, retained for package callers such as
+    /// SEP-1699 stream control. This accessor alone does not authorize routing
+    /// a different server's outgoing request to that ID.
+    package static var currentRequestID: ID? { handlerRequestContext?.requestID }
+
+    /// Request association qualified by the sending server, scoped to its
+    /// selected connection.send call and transparent forwarding delegates.
+    @TaskLocal package static var outboundRequestID: ID? = nil
 
     // MARK: - Registration
 
@@ -489,10 +497,16 @@ public actor Server {
             throw MCPError.internalError("Server is closed or at its write limit")
         }
         let id = UUID()
+        let context = Self.handlerRequestContext
+        let associatedRequestID = context?.owner == lifetimeID ? context?.requestID : nil
         let writer = Task {
             try await Self.$enteredLifetimeIDs.withValue(Self.enteredLifetimeIDs.union([lifetimeID])) {
                 try Task.checkCancellation()
-                try await connection.send(data)
+                // Bind nil too: a nested send by another server must clear any
+                // inherited wire association instead of claiming its request ID.
+                try await Self.$outboundRequestID.withValue(associatedRequestID) {
+                    try await connection.send(data)
+                }
             }
         }
         wireTasks[id] = writer
@@ -862,9 +876,9 @@ public actor Server {
         }
 
         // Create a task to handle the request with cancellation support.
-        // Set currentRequestID as a task local so handlers can identify the active request.
+        // Keep request identity and its owning server together through child tasks.
         var handlerTask: Task<Response<AnyMethod>, Error>!
-        Server.$currentRequestID.withValue(request.id) {
+        Self.$handlerRequestContext.withValue(HandlerRequestContext(owner: lifetimeID, requestID: request.id)) {
             handlerTask = Task<Response<AnyMethod>, Error> {
                 do {
                     // Check if task was cancelled before starting
