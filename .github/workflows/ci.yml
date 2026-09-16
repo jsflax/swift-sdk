@@ -4,7 +4,7 @@ on:
   push:
     branches: ["main"]
   pull_request:
-    branches: ["main"]
+    branches: ["main", "codex/sdk-0.12-base-20260916"]
 
 permissions:
   contents: read
