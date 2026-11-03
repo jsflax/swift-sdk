@@ -18,3 +18,9 @@ public protocol Transport: Actor {
     /// Receives data in an async sequence
     func receive() -> AsyncThrowingStream<Data, Swift.Error>
 }
+
+/// Optional lifecycle capability for HTTP transports and custody adapters around them.
+/// The client publishes the negotiated version before sending initialized or later requests.
+public protocol NegotiatedProtocolVersionTransport: Transport {
+    func updateNegotiatedProtocolVersion(_ version: String) async
+}

@@ -1,10 +1,47 @@
 import Foundation
+import Logging
 import Testing
 
 @testable import MCP
 
 @Suite("Client Tests", .timeLimit(.minutes(1)))
 struct ClientTests {
+    @Test("Wrapped transport receives negotiation before initialized and later requests")
+    func testWrappedTransportNegotiationOrdering() async throws {
+        let transport = NegotiationResponseTransport()
+        let wrapper = NegotiationForwardingTransport(transport)
+        let client = Client(name: "wrapped-negotiation", version: "1")
+        do {
+            let result = try await client.connect(transport: wrapper)
+            #expect(result.protocolVersion == "2025-03-26")
+            let tools = try await client.listTools()
+            #expect(tools.tools.isEmpty)
+            #expect(await transport.events == [
+                "initialize@unset", "negotiated@2025-03-26",
+                "notifications/initialized@2025-03-26", "tools/list@2025-03-26",
+            ])
+        } catch { await client.disconnect(); throw error }
+        await client.disconnect()
+        #expect(await transport.closed)
+    }
+
+    @Test("Legacy transport still initializes and sends requests without negotiation capability")
+    func testLegacyTransportWithoutNegotiationCapability() async throws {
+        let transport = NegotiationResponseTransport()
+        let client = Client(name: "legacy-negotiation", version: "1")
+        do {
+            let result = try await client.connect(transport: transport)
+            #expect(result.protocolVersion == "2025-03-26")
+            let tools = try await client.listTools()
+            #expect(tools.tools.isEmpty)
+            #expect(await transport.events == [
+                "initialize@unset", "notifications/initialized@unset", "tools/list@unset",
+            ])
+        } catch { await client.disconnect(); throw error }
+        await client.disconnect()
+        #expect(await transport.closed)
+    }
+
     @Test("Client connect and disconnect")
     func testClientConnectAndDisconnect() async throws {
         let transport = MockTransport()
@@ -771,5 +808,70 @@ struct ClientTests {
         // (If it did, the test would have crashed)
 
         await client.disconnect()
+    }
+}
+
+/// Only the wire response boundary is substituted. The actual Client performs
+/// initialization, capability discovery, notification and later-request ordering.
+private actor NegotiationResponseTransport: Transport {
+    nonisolated let logger = Logger(label: "mcp.negotiation.fixture")
+    nonisolated let incoming: AsyncThrowingStream<Data, any Error>
+    private let input: AsyncThrowingStream<Data, any Error>.Continuation
+    private var negotiatedVersion: String?
+    private(set) var events: [String] = []
+    private(set) var closed = false
+
+    init() {
+        let pair = AsyncThrowingStream<Data, any Error>.makeStream(bufferingPolicy: .bufferingOldest(4))
+        incoming = pair.stream
+        input = pair.continuation
+    }
+
+    func connect() async throws {
+        guard !closed else { throw CancellationError() }
+    }
+    nonisolated func receive() -> AsyncThrowingStream<Data, any Error> { incoming }
+    func disconnect() async { closed = true; input.finish() }
+
+    func recordNegotiatedVersion(_ version: String) {
+        events.append("negotiated@\(version)")
+        negotiatedVersion = version
+    }
+
+    func send(_ bytes: Data) async throws {
+        guard !closed else { throw CancellationError() }
+        let object = try #require(JSONSerialization.jsonObject(with: bytes) as? [String: Any])
+        let method = try #require(object["method"] as? String)
+        events.append("\(method)@\(negotiatedVersion ?? "unset")")
+        switch method {
+        case Initialize.name:
+            let request = try JSONDecoder().decode(Request<Initialize>.self, from: bytes)
+            let result = Initialize.Result(
+                protocolVersion: "2025-03-26", capabilities: .init(tools: .init()),
+                serverInfo: .init(name: "negotiation-fixture", version: "1"), instructions: nil)
+            input.yield(try JSONEncoder().encode(Initialize.response(id: request.id, result: result)))
+        case InitializedNotification.name:
+            break
+        case ListTools.name:
+            let request = try JSONDecoder().decode(Request<ListTools>.self, from: bytes)
+            input.yield(try JSONEncoder().encode(ListTools.response(id: request.id, result: .init(tools: []))))
+        default:
+            throw MCPError.invalidRequest("Unexpected negotiation fixture method: \(method)")
+        }
+    }
+}
+
+/// The wrapper is deliberately not HTTPClientTransport. Optional capability
+/// dispatch must reach it while an ordinary Transport remains valid above.
+private actor NegotiationForwardingTransport: NegotiatedProtocolVersionTransport {
+    nonisolated let logger = Logger(label: "mcp.negotiation.wrapper")
+    nonisolated let wrapped: NegotiationResponseTransport
+    init(_ wrapped: NegotiationResponseTransport) { self.wrapped = wrapped }
+    func connect() async throws { try await wrapped.connect() }
+    func disconnect() async { await wrapped.disconnect() }
+    func send(_ bytes: Data) async throws { try await wrapped.send(bytes) }
+    nonisolated func receive() -> AsyncThrowingStream<Data, any Error> { wrapped.incoming }
+    func updateNegotiatedProtocolVersion(_ version: String) async {
+        await wrapped.recordNegotiatedVersion(version)
     }
 }
