@@ -423,6 +423,21 @@ public actor Server {
         return self
     }
 
+    /// Register a typed handler that also receives the original request ID.
+    /// The ID is transport correlation, not application authorization. The result is
+    /// returned through the same dispatch and response path with that unchanged ID.
+    @discardableResult
+    public func withRequestHandler<M: Method>(
+        _ type: M.Type,
+        handler: @escaping @Sendable (Request<M>) async throws -> M.Result
+    ) -> Self {
+        methodHandlers[M.name] = TypedRequestHandler { (request: Request<M>) -> Response<M> in
+            let result = try await handler(request)
+            return Response(id: request.id, result: result)
+        }
+        return self
+    }
+
     /// Register a notification handler
     @discardableResult
     public func onNotification<N: Notification>(

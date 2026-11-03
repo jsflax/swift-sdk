@@ -656,7 +656,7 @@ public actor Client {
 
         // For HTTP transport, ensure subsequent MCP-Protocol-Version headers
         // reflect the negotiated lifecycle version.
-        if let httpTransport = connection as? HTTPClientTransport {
+        if let httpTransport = connection as? any NegotiatedProtocolVersionTransport {
             await httpTransport.updateNegotiatedProtocolVersion(result.protocolVersion)
         }
 
